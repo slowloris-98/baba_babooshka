@@ -14,6 +14,12 @@ import shutil
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import sentry_sdk
+
 from uagents import Agent, Context, Model, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
@@ -52,6 +58,18 @@ def _resolve_claude() -> str | None:
 
 CLAUDE_BIN = _resolve_claude()
 
+# ---------------------------------------------------------------------------
+# Sentry — initialize before any agent/framework code
+# ---------------------------------------------------------------------------
+_sentry_dsn = os.environ.get("SENTRY_DSN", "")
+if _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+        traces_sample_rate=1.0,
+        enable_logs=True,
+    )
+
 
 async def run_claude_code(prompt: str, logger=None) -> str:
     """Spawn Claude Code headlessly to handle `prompt`; return its text result.
@@ -71,7 +89,6 @@ async def run_claude_code(prompt: str, logger=None) -> str:
         prompt,
         "--output-format",
         "json",
-        "--dangerously-skip-permissions",
         "--max-turns",
         str(CLAUDE_MAX_TURNS),
     ]
@@ -85,10 +102,12 @@ async def run_claude_code(prompt: str, logger=None) -> str:
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=CLAUDE_WORKDIR,
+            env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
+        sentry_sdk.capture_exception(exc)
         return f"Error: failed to start Claude Code: {exc}"
 
     try:
@@ -98,6 +117,14 @@ async def run_claude_code(prompt: str, logger=None) -> str:
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
+        with sentry_sdk.new_scope() as scope:
+            scope.set_extra("prompt_preview", prompt[:300])
+            scope.set_extra("timeout_seconds", CLAUDE_TIMEOUT)
+            scope.set_extra("workdir", CLAUDE_WORKDIR)
+            sentry_sdk.capture_message(
+                f"Claude Code timed out after {CLAUDE_TIMEOUT}s",
+                level="error",
+            )
         return (
             f"Error: Claude Code timed out after {CLAUDE_TIMEOUT}s and was stopped. "
             "Try a smaller task or raise CLAUDE_TIMEOUT."
@@ -108,6 +135,16 @@ async def run_claude_code(prompt: str, logger=None) -> str:
 
     if proc.returncode != 0:
         detail = stderr or stdout or "(no output)"
+        with sentry_sdk.new_scope() as scope:
+            scope.set_extra("exit_code", proc.returncode)
+            scope.set_extra("stderr", stderr[:2000])
+            scope.set_extra("stdout", stdout[:2000])
+            scope.set_extra("prompt_preview", prompt[:300])
+            scope.set_extra("workdir", CLAUDE_WORKDIR)
+            sentry_sdk.capture_message(
+                f"Claude Code exited with code {proc.returncode}",
+                level="error",
+            )
         return f"Error: Claude Code exited with code {proc.returncode}.\n{detail}"
 
     # `--output-format json` prints a single JSON object with a `result` field.
