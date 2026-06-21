@@ -19,6 +19,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import sentry_sdk
+from agent_memory_client import MemoryAPIClient, MemoryClientConfig
+from agent_memory_client.filters import UserId
+from agent_memory_client.models import ClientMemoryRecord
 
 from uagents import Agent, Context, Model, Protocol
 from uagents_core.contrib.protocols.chat import (
@@ -45,6 +48,10 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 # Bound on autonomous agentic turns for a single run.
 CLAUDE_MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "40"))
+
+MEMORY_SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8001")
+MEMORY_ENABLED = os.environ.get("MEMORY_ENABLED", "true").lower() == "true"
+_memory_client: MemoryAPIClient | None = None
 
 
 def _resolve_claude() -> str | None:
@@ -159,6 +166,42 @@ async def run_claude_code(prompt: str, logger=None) -> str:
     return stdout or stderr or "(Claude Code produced no output.)"
 
 
+async def get_memory_context(user_id: str, query: str) -> str:
+    """Search long-term memory and return formatted prior context, or empty string."""
+    if not _memory_client:
+        return ""
+    try:
+        results = await _memory_client.search_long_term_memory(
+            text=query, user_id=UserId(eq=user_id), limit=5
+        )
+        if not results.memories:
+            return ""
+        lines = ["[Prior context from memory:]"]
+        for m in results.memories:
+            lines.append(f"- {m.text}")
+        return "\n".join(lines) + "\n\n"
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+        return ""
+
+
+async def save_interaction(user_id: str, prompt: str, result: str) -> None:
+    """Persist the prompt+result to long-term memory."""
+    if not _memory_client:
+        return
+    try:
+        summary = f"User asked: {prompt[:300]}\nAgent result: {result[:500]}"
+        await _memory_client.create_long_term_memory(
+            [
+                ClientMemoryRecord(
+                    text=summary, user_id=user_id, memory_type="semantic"
+                )
+            ]
+        )
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -176,12 +219,20 @@ agent = Agent(
 
 @agent.on_event("startup")
 async def on_startup(ctx: Context):
+    global _memory_client
     ctx.logger.info(f"Agent '{agent.name}' address: {agent.address}")
     ctx.logger.info(f"Claude binary: {CLAUDE_BIN or 'NOT FOUND on PATH'}")
     ctx.logger.info(f"Claude workdir: {CLAUDE_WORKDIR}")
     ctx.logger.info(f"Claude model: {CLAUDE_MODEL or '(default)'}")
     if CLAUDE_BIN is None:
         ctx.logger.warning("`claude` not found — requests will return an error.")
+    if MEMORY_ENABLED:
+        _memory_client = MemoryAPIClient(
+            MemoryClientConfig(base_url=MEMORY_SERVER_URL)
+        )
+        ctx.logger.info(f"Memory client connected to {MEMORY_SERVER_URL}")
+    else:
+        ctx.logger.info("Agent memory disabled (MEMORY_ENABLED=false)")
 
 
 # --- Chat protocol (human chat via ASI:One / Agentverse) -------------------
@@ -216,7 +267,9 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             continue
         if isinstance(item, TextContent):
             ctx.logger.info(f"Request from {sender}: {item.text[:120]!r}")
-            result = await run_claude_code(item.text, ctx.logger)
+            context = await get_memory_context(sender, item.text)
+            result = await run_claude_code(context + item.text, ctx.logger)
+            await save_interaction(sender, item.text, result)
             await ctx.send(sender, _new_chat(result))
             ctx.logger.info(f"Replied to {sender}")
 
@@ -241,7 +294,9 @@ class ClaudeResponse(Model):
 @agent.on_message(model=ClaudeRequest, replies=ClaudeResponse)
 async def handle_request(ctx: Context, sender: str, msg: ClaudeRequest):
     ctx.logger.info(f"ClaudeRequest from {sender}: {msg.prompt[:120]!r}")
-    result = await run_claude_code(msg.prompt, ctx.logger)
+    context = await get_memory_context(sender, msg.prompt)
+    result = await run_claude_code(context + msg.prompt, ctx.logger)
+    await save_interaction(sender, msg.prompt, result)
     await ctx.send(sender, ClaudeResponse(result=result))
 
 
